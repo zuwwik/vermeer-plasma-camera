@@ -8,3 +8,6 @@
 .cache
 .idea
 /cmake-build*
+
+/build/
+/build-*/
