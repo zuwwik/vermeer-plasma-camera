@@ -37,6 +37,8 @@ class PlasmaCameraManager : public QObject
     // preview and video recording
     Q_PROPERTY(PlasmaCamera *plasmaCamera READ plasmaCamera WRITE setPlasmaCamera NOTIFY plasmaCameraChanged)
     Q_PROPERTY(QVideoSink *videoSink READ videoSink WRITE setVideoSink NOTIFY videoSinkChanged)
+    Q_PROPERTY(int previewRotation READ previewOrientationDegrees NOTIFY previewRotationChanged)
+    Q_PROPERTY(bool previewMirrored READ previewMirrored NOTIFY previewRotationChanged)
     Q_PROPERTY(QMediaRecorder *recorder READ recorder WRITE setRecorder NOTIFY recorderChanged)
     Q_PROPERTY(bool audioRecordingEnabled READ audioRecordingEnabled WRITE setAudioRecordingEnabled NOTIFY audioRecordingEnabledChanged)
     Q_PROPERTY(QAudioInput *audioInput READ audioInput WRITE setAudioInput NOTIFY audioInputChanged)
@@ -150,6 +152,7 @@ public:
     Q_INVOKABLE void stopRecordingVideo();
 
 Q_SIGNALS:
+    void previewRotationChanged();
     void errorChanged();
     void errorOccurred(int id, Error error, const QString &errorString);
 
@@ -241,6 +244,8 @@ private:
      * This adds the camera orientation and the device orientation degrees together.
      */
     float outputOrientationDegrees() const;
+    int previewOrientationDegrees() const;
+    bool previewMirrored() const;
 
     // error handling
     Error m_error;
@@ -279,12 +284,18 @@ private:
     // Device orientation for correct rotation
     QOrientationSensor m_orientationSensor;
     float m_orientationSensorDegrees = 0.0f;
+    float m_pendingOrientationDegrees = 0.0f;
+    float m_recordingOrientationDegrees = 0.0f;
+    QTimer m_orientationSettleTimer;
+    int m_publishedPreviewRotation = -1;
+    bool m_publishedPreviewMirrored = false;
 
     // internal
     Settings m_settings;
 
     int m_imageCaptureNum = 0;
     QString m_imageCaptureFileName;
+    QMap<int, QString> m_pendingPhotos;
 
     bool m_isSavingVideo = false;
     bool m_droppedFrames = false;

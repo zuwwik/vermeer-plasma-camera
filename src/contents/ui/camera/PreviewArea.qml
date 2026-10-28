@@ -66,6 +66,8 @@ Item {
 
         Image {
             id: imagePreview
+            asynchronous: true
+            sourceSize: Qt.size(256, 256)
             fillMode: Image.PreserveAspectCrop
             anchors.fill: parent
             source: preview.imageUrl

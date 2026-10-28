@@ -109,6 +109,8 @@ Kirigami.Page {
         anchors.fill: parent
 
         camera: root.camera
+        orientation: root.captureSession.previewRotation
+        mirrored: root.captureSession.previewMirrored
         bottomMargin: controlContainer.height
 
         // Header controls

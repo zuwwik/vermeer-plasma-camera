@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "worker.h"
+#include <QtConcurrent>
+#include <QFutureWatcher>
+#include <algorithm>
 
 static const QMap<libcamera::PixelFormat, QImage::Format> NATIVE_FORMATS{
     {libcamera::formats::ABGR8888, QImage::Format_RGBX8888},
@@ -15,10 +18,14 @@ static const QMap<libcamera::PixelFormat, QImage::Format> NATIVE_FORMATS{
 
 Worker::Worker() = default;
 
-Worker::~Worker() = default;
+Worker::~Worker()
+{
+    m_photoPool.waitForDone();
+}
 
 void Worker::init()
 {
+    m_photoPool.setMaxThreadCount(1);
     // start init after we have moved to the other thread
     m_framePollTimer = new QTimer(this);
     m_framePollTimer->setInterval(1000 / 60); // manually set 60 fps
@@ -84,10 +91,90 @@ void Worker::unsetCamera()
     }
 }
 
-void Worker::capture()
+void Worker::capture(const PhotoOptions &options)
 {
-    m_stillCaptureFrames.clear();
-    setMode(CaptureMode::StillImage);
+    const unsigned int queued = m_photoJobs + unsigned(m_photoOptions.has_value()) + m_waitingPhotos.size();
+    if (!m_camera || queued >= 3) {
+        Q_EMIT photoFailed(options.id, QStringLiteral("The photo queue is busy"));
+        Q_EMIT photoCapacity(m_camera && queued < 3);
+        return;
+    }
+    if (m_photoOptions) {
+        m_waitingPhotos.enqueue(options);
+    } else {
+        m_pauseFocus = m_lastAfState == libcamera::controls::AfStateFocused && m_camera->controls().count(&libcamera::controls::AfPause);
+        m_photoOptions = options;
+        m_photoFrames.clear();
+    }
+    Q_EMIT photoCapacity(queued + 1 < 3);
+}
+
+void Worker::submitPhoto(QImage fallback)
+{
+    if (!m_photoOptions) return;
+    PhotoOptions options = *m_photoOptions;
+    auto frames = std::move(m_photoFrames);
+    m_photoFrames.clear();
+    m_photoOptions.reset();
+    m_resumeFocus = m_pauseFocus; m_pauseFocus = false;
+    m_photoJobs++;
+    if (!m_waitingPhotos.isEmpty()) {
+        m_photoOptions = m_waitingPhotos.dequeue();
+        m_pauseFocus = m_resumeFocus;
+        m_resumeFocus = false;
+    }
+    Q_EMIT photoCapacity(m_photoJobs + unsigned(m_photoOptions.has_value()) + m_waitingPhotos.size() < 3);
+    auto *watcher = new QFutureWatcher<PhotoResult>(this);
+    connect(watcher, &QFutureWatcher<PhotoResult>::finished, this, [this, watcher]() {
+        const PhotoResult result = watcher->result();
+        watcher->deleteLater();
+        m_photoJobs--;
+        Q_EMIT photoCapacity(m_photoJobs + unsigned(m_photoOptions.has_value()) + m_waitingPhotos.size() < 3);
+        if (result.error.isEmpty()) Q_EMIT photoSaved(result.options.id, result.options.path);
+        else Q_EMIT photoFailed(result.options.id, result.error);
+    });
+    watcher->setFuture(QtConcurrent::run(&m_photoPool, [options, frames = std::move(frames), fallback]() mutable {
+        return processPhoto(options, std::move(frames), fallback);
+    }));
+}
+
+void Worker::collectPhoto(libcamera::Request *request, const QImage &fullFrame)
+{
+    if (!m_photoOptions) return;
+    if (!m_rawStream || !request->buffers().count(m_rawStream)) {
+        submitPhoto(fullFrame.copy());
+        return;
+    }
+    const auto &config = m_rawStream->configuration();
+    auto *buffer = request->buffers().at(m_rawStream);
+    auto bytes = m_mappedBuffers.at(buffer)->data(0);
+    if (bytes.size() < config.frameSize) {
+        Q_EMIT photoFailed(m_photoOptions->id, QStringLiteral("Incomplete RAW buffer"));
+        m_photoOptions.reset();
+        Q_EMIT photoCapacity(m_photoJobs < 3);
+        return;
+    }
+    PhotoRawFrame frame;
+    frame.data.assign(bytes.begin(), bytes.begin() + config.frameSize);
+    auto &p = frame.parameters;
+    p.width = config.size.width; p.height = config.size.height; p.stride = config.stride;
+    if (config.pixelFormat == libcamera::formats::SBGGR10_CSI2P) p.order = libcamera::StillBayerOrder::BGGR;
+    else if (config.pixelFormat == libcamera::formats::SGBRG10_CSI2P) p.order = libcamera::StillBayerOrder::GBRG;
+    else if (config.pixelFormat == libcamera::formats::SGRBG10_CSI2P) p.order = libcamera::StillBayerOrder::GRBG;
+    else p.order = libcamera::StillBayerOrder::RGGB;
+    const auto &metadata = request->metadata();
+    if (auto gains = metadata.get(libcamera::controls::ColourGains))
+        p.whiteBalance = {(*gains)[0], 1, (*gains)[1]};
+    if (auto matrix = metadata.get(libcamera::controls::ColourCorrectionMatrix))
+        std::copy(matrix->begin(), matrix->end(), p.colorMatrix.begin());
+    p.gamma = metadata.get(libcamera::controls::Gamma).value_or(2.2f);
+    p.contrast = metadata.get(libcamera::controls::Contrast).value_or(1.f);
+    p.analogueGain = std::max(1.f, metadata.get(libcamera::controls::AnalogueGain).value_or(1.f));
+    p.exposureProduct = metadata.get(libcamera::controls::ExposureTime).value_or(0) * double(p.analogueGain);
+    if (auto black = metadata.get(libcamera::controls::SensorBlackLevels))
+        p.blackLevel = (*black)[0] / 64.f;
+    m_photoFrames.push_back(std::move(frame));
+    if (m_photoFrames.size() == 3) submitPhoto();
 }
 
 void Worker::setSettings(const Settings& settings)
@@ -168,6 +255,13 @@ void Worker::requestNextFrame()
     // Load our settings onto the camera request's controls
     m_settings.set(request->controls());
 
+    if (m_camera->controls().count(&libcamera::controls::AfPause)) {
+        if (m_pauseFocus) request->controls().set(libcamera::controls::AfPause, libcamera::controls::AfPauseImmediate);
+        else if (m_resumeFocus) {
+            request->controls().set(libcamera::controls::AfPause, libcamera::controls::AfPauseResume);
+            m_resumeFocus = false;
+        }
+    }
     // Queue request in camera for frame
     m_camera->queueRequest(request);
 }
@@ -192,45 +286,24 @@ void Worker::requestComplete(libcamera::Request *request)
 
 void Worker::processRequestDataAndEmit()
 {
-    // Populates m_image
-    processRequestData();
-
-    // Implement photo capture
-    if (m_mode == CaptureMode::StillImage) {
-        const QMutexLocker lock(&m_stillCaptureFramesMutex);
-
-        if (m_stillCaptureFrames.length() >= 5) {
-            return;
-        }
-
-        // Add image to frames used for shot
-        m_stillCaptureFrames.enqueue(m_image.copy());
-
-        // Once we reach 5 frames, emit the photo
-        if (m_stillCaptureFrames.length() == 5) {
-            setMode(CaptureMode::ViewFinder);
-            Q_EMIT stillCaptureFrames(m_stillCaptureFrames);
-        }
-    }
-
-    // Emit view finder frame, m_image is moved for performance
-    Q_EMIT viewFinderFrame(std::move(m_image));
+    if (!processRequestData()) return;
+    Q_EMIT viewFinderFrame(m_image);
 }
 
-void Worker::processRequestData()
+bool Worker::processRequestData()
 {
     libcamera::Request *request;
     {
         // Obtain a finished request from the queue
         const QMutexLocker lock(&m_doneMutex);
         if (m_doneQueue.isEmpty()) {
-            return;
+            return false;
         }
         request = m_doneQueue.dequeue();
     }
 
     if (!request->buffers().count(m_stream)) {
-        return;
+        return false;
     }
 
     libcamera::FrameBuffer *buffer = request->buffers().at(m_stream);
@@ -238,17 +311,28 @@ void Worker::processRequestData()
 
     // Load frame into m_image
     size_t size = buffer->metadata().planes()[0].bytesused;
+    QImage fullFrame;
     if (getNativeFormats().contains(m_format)) {
-        m_image = QImage(image->data(0).data(), m_size.width(), m_size.height(), static_cast<qsizetype>(size) / m_size.height(), NATIVE_FORMATS[m_format]);
+        fullFrame = QImage(image->data(0).data(), m_size.width(), m_size.height(),
+                           static_cast<qsizetype>(size) / m_size.height(), NATIVE_FORMATS[m_format]);
     } else {
-        m_converter.convert(image, size, &m_image);
+        m_converter.convert(image, size, &m_conversionImage);
+        fullFrame = m_conversionImage;
     }
+
+    m_lastAfState = request->metadata().get(libcamera::controls::AfState).value_or(libcamera::controls::AfStateIdle);
+    // Preserve the complete RAW/RGB photo before reducing the display texture.
+    collectPhoto(request, fullFrame);
+    m_image = fullFrame.width() > 1920 || fullFrame.height() > 1920
+            ? fullFrame.scaled(1920, 1920, Qt::KeepAspectRatio, Qt::FastTransformation)
+            : fullFrame.copy();
 
     {
         // Return request to the free queue to be used for new requests
         const QMutexLocker lock(&m_freeMutex);
         m_freeQueue.enqueue(request);
     }
+    return true;
 }
 
 void Worker::startViewFinder()
@@ -259,14 +343,17 @@ void Worker::startViewFinder()
 
     qDebug() << "Starting view finder in worker";
 
-    /*
-     * https://libcamera.org/api-html/namespacelibcamera.html#a295d1f5e7828d95c0b0aabc0a8baac03
-     * The StillCapture and Viewfinder roles both generate a config that uses the same resolution
-     * while the documentation states that the image will be captured in higher quality I prefer
-     * the Viewfinder config because it appears that the higher resource usage of StillCapture
-     * makes app more unstable (it could also be related to the demands of restarting the camera)
-     */
-    m_config = m_camera->generateConfiguration({libcamera::StreamRole::Viewfinder});
+    m_rawStream = nullptr;
+    m_lastAfState = libcamera::controls::AfStateIdle;
+    m_pauseFocus = m_resumeFocus = false;
+    m_config = m_camera->generateConfiguration({libcamera::StreamRole::Viewfinder, libcamera::StreamRole::Raw});
+    if (m_config && m_config->size() == 2) {
+        auto raw = m_config->at(1).pixelFormat;
+        if (raw != libcamera::formats::SRGGB10_CSI2P && raw != libcamera::formats::SGRBG10_CSI2P &&
+            raw != libcamera::formats::SGBRG10_CSI2P && raw != libcamera::formats::SBGGR10_CSI2P)
+            m_config.reset();
+    } else m_config.reset();
+    if (!m_config) m_config = m_camera->generateConfiguration({libcamera::StreamRole::Viewfinder});
 
     configure();
 
@@ -295,6 +382,19 @@ void Worker::stopViewFinder()
 {
     qDebug() << "stop view finder";
     m_framePollTimer->stop();
+    while (!m_waitingPhotos.isEmpty()) {
+        const auto options = m_waitingPhotos.dequeue();
+        Q_EMIT photoFailed(options.id, QStringLiteral("Camera stopped before exposure"));
+    }
+    if (m_photoOptions) {
+        if (!m_photoFrames.empty()) submitPhoto();
+        else {
+            Q_EMIT photoFailed(m_photoOptions->id, QStringLiteral("Camera stopped before exposure"));
+            m_photoOptions.reset();
+        }
+    }
+    m_image = QImage();
+    m_conversionImage = QImage();
 
     if (m_camera) {
         // All pending requests are cancelled
@@ -314,8 +414,12 @@ void Worker::stopViewFinder()
     m_config.reset();
 
     if (m_allocator) {
+        m_mappedBuffers.clear();
         m_allocator->free(m_stream);
+        if (m_rawStream) m_allocator->free(m_rawStream);
         delete m_allocator;
+        m_allocator = nullptr;
+        m_rawStream = nullptr;
     }
 
     m_mappedBuffers.clear();
@@ -487,6 +591,7 @@ void Worker::configure()
     }
 
     m_stream = m_config->at(0).stream();
+    m_rawStream = m_config->size() > 1 ? m_config->at(1).stream() : nullptr;
 
     ret = setFormat(QSize(static_cast<int>(streamConfig.size.width), static_cast<int>(streamConfig.size.height)),
                     streamConfig.pixelFormat,
@@ -517,12 +622,13 @@ int Worker::setFormat(
     const unsigned int stride)
 {
     m_image = QImage();
+    m_conversionImage = QImage();
     if (!getNativeFormats().contains(format)) {
         if (const int ret = m_converter.configure(format, size, stride); ret < 0) {
             return ret;
         }
 
-        m_image = QImage(size, QImage::Format_RGB32);
+        m_conversionImage = QImage(size, QImage::Format_RGB32);
         qDebug() << "Using software format conversion from" << format.toString();
     }
 
@@ -550,10 +656,20 @@ int Worker::createRequests()
         return ret;
     }
 
+    if (m_rawStream) {
+        ret = m_allocator->allocate(m_rawStream);
+        if (ret < 0) return ret;
+        for (const auto &buffer : m_allocator->buffers(m_rawStream)) {
+            auto image = Image::fromFrameBuffer(buffer.get(), Image::MapMode::ReadOnly);
+            if (!image) return -ENOMEM;
+            m_mappedBuffers[buffer.get()] = std::move(image);
+        }
+    }
     const size_t allocated = m_allocator->buffers(m_stream).size();
     qDebug() << "Allocated" << allocated << "buffers for stream";
 
     // using the created buffers we create a mapping from the buffer to an image
+    size_t rawIndex = 0;
     for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : m_allocator->buffers(m_stream)) {
         // Map memory buffers and cache the mappings
         std::unique_ptr<Image> image =
@@ -572,6 +688,12 @@ int Worker::createRequests()
         if (ret < 0) {
             qWarning() << "Can't set buffer for request";
             return ret;
+        }
+        if (m_rawStream) {
+            const auto &buffers = m_allocator->buffers(m_rawStream);
+            if (rawIndex >= buffers.size()) return -ENOMEM;
+            ret = request->addBuffer(m_rawStream, buffers[rawIndex++].get());
+            if (ret < 0) return ret;
         }
         qDebug() << "Added new request: " << request->toString();
 

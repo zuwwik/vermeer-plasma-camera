@@ -13,10 +13,11 @@ set(plasma-camera_SRCS
     plasmacamera/path.cpp
     plasmacamera/settings.cpp
     plasmacamera/worker.cpp
+    plasmacamera/photojob.cpp
     resources.qrc
 )
 
-find_package(Qt6 REQUIRED COMPONENTS Multimedia)
+find_package(Qt6 REQUIRED COMPONENTS Multimedia Concurrent)
 
 add_executable(plasma-camera ${plasma-camera_SRCS})
 target_compile_options(plasma-camera PUBLIC -fexceptions)
@@ -28,6 +29,7 @@ target_link_libraries(
         Qt::Svg
         Qt::Sensors
         Qt6::Multimedia
+        Qt6::Concurrent
         KF6::CoreAddons
         KF6::I18n
         KF6::ConfigGui
@@ -64,3 +66,13 @@ endif()
 
 target_include_directories(plasma-camera PRIVATE ${CMAKE_BINARY_DIR})
 install(TARGETS plasma-camera ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
+
+option(VERMEER_CAMERA_TESTS "Build RAW still/preview integration check" OFF)
+if(VERMEER_CAMERA_TESTS)
+    add_executable(camera-still-check test-still-worker.cpp plasmacamera/worker.cpp
+        plasmacamera/image.cpp plasmacamera/converter.cpp plasmacamera/settings.cpp plasmacamera/photojob.cpp)
+    target_compile_options(camera-still-check PRIVATE -fexceptions)
+    target_include_directories(camera-still-check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(camera-still-check PRIVATE Qt::Core Qt::Gui Qt::Multimedia Qt::Concurrent PkgConfig::LIBCAMERA LibExiv2::LibExiv2)
+    install(TARGETS camera-still-check RUNTIME DESTINATION bin)
+endif()

@@ -54,11 +54,9 @@ PlasmaCamera::PlasmaCamera(QObject *parent) : QObject(parent)
 
     // resend frames that we received from the camera worker
     connect(m_cameraWorker, &Worker::viewFinderFrame, this, &PlasmaCamera::viewFinderFrame);
-    connect(m_cameraWorker, &Worker::stillCaptureFrames, this, &PlasmaCamera::stillCaptureFrames);
-    connect(m_cameraWorker, &Worker::stillCaptureFrames, this, [this]() {
-        // Finished taking image
-        setBusy(false);
-    });
+    connect(m_cameraWorker, &Worker::photoSaved, this, &PlasmaCamera::photoSaved);
+    connect(m_cameraWorker, &Worker::photoFailed, this, &PlasmaCamera::photoFailed);
+    connect(m_cameraWorker, &Worker::photoCapacity, this, [this](bool available) { setBusy(!available); });
 
     // get errors from the camera worker
     connect(m_cameraWorker, &Worker::errorOccurred, this, &PlasmaCamera::setError);
@@ -175,14 +173,13 @@ QCameraFormat PlasmaCamera::cameraFormat() const
     return m_cameraFormat;
 }
 
-bool PlasmaCamera::captureImage()
+bool PlasmaCamera::captureImage(const PhotoOptions &options)
 {
-    if (m_state != State::Running) {
+    if (m_state != State::Running || m_busy) {
         return false;
     }
-
     setBusy(true);
-    QMetaObject::invokeMethod(m_cameraWorker, "capture", Qt::QueuedConnection);
+    QMetaObject::invokeMethod(m_cameraWorker, [worker = m_cameraWorker, options]() { worker->capture(options); }, Qt::QueuedConnection);
 
     return true;
 }

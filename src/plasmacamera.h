@@ -140,7 +140,7 @@ public:
     /*!
      * Capture an image with the current camera.
      */
-    bool captureImage();
+    bool captureImage(const PhotoOptions &options);
 
     // Focus
     QSize afWindow() const;
@@ -181,7 +181,8 @@ Q_SIGNALS:
      * for higher quality capture it requires restarting the camera which is simply too slow
      */
     void viewFinderFrame(const QImage &frame); // connect to this to get new frames
-    void stillCaptureFrames(const QQueue<QImage> &frames); // connect to this to get captures
+    void photoSaved(int id, const QString &path);
+    void photoFailed(int id, const QString &error);
 
     // Focus
     void afWindowChanged(const QSize &newAfWindow);

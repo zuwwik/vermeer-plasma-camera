@@ -6,6 +6,7 @@
 
 #include "camerasettings.h"
 #include "plasmacamera/path.h"
+#include "plasmacamera/rotation.h"
 #include "plasmacameramanager.h"
 
 #include <exiv2/exiv2.hpp>
@@ -30,7 +31,14 @@ PlasmaCameraManager::PlasmaCameraManager(QObject *parent)
     connect(&m_videoFrameTimer, &QTimer::timeout, this, &PlasmaCameraManager::processVideoFrame);
     connect(&m_orientationSensor, &QOrientationSensor::readingChanged, this, &PlasmaCameraManager::updateFromOrientationSensor);
 
-    m_orientationSensor.start();
+    m_orientationSettleTimer.setSingleShot(true);
+    m_orientationSettleTimer.setInterval(180);
+    connect(&m_orientationSettleTimer, &QTimer::timeout, this, [this]() {
+        m_orientationSensorDegrees = m_pendingOrientationDegrees;
+        qInfo() << "Device orientation:" << m_orientationSensorDegrees;
+    });
+    if (!m_orientationSensor.start())
+        qWarning() << "Orientation sensor unavailable in this session";
 
     // Listen to audio inputs changing, and change audio device if needed
     QMediaDevices *mediaDevices = new QMediaDevices(this);
@@ -58,7 +66,7 @@ QString PlasmaCameraManager::errorString() const
 
 bool PlasmaCameraManager::isReadyForCapture() const
 {
-    return m_readyForCapture;
+    return m_readyForCapture && m_plasmaCamera && !m_plasmaCamera->busy();
 }
 
 PlasmaCameraManager::FileFormat PlasmaCameraManager::fileFormat() const
@@ -176,6 +184,7 @@ void PlasmaCameraManager::startRecordingVideo()
     metaData.insert(QMediaMetaData::Date, QDateTime::currentDateTime());
     m_recorder->setMetaData(metaData);
 
+    m_recordingOrientationDegrees = m_orientationSensorDegrees;
     m_recorder->record();
 }
 
@@ -258,7 +267,9 @@ void PlasmaCameraManager::setPlasmaCamera(PlasmaCamera *plasmaCamera)
             disconnect(plasmaCamera, &PlasmaCamera::availableChanged, this, &PlasmaCameraManager::setReadyForCapture);
             disconnect(plasmaCamera, &PlasmaCamera::settingsChanged, this, &PlasmaCameraManager::setSettings);
             disconnect(plasmaCamera, &PlasmaCamera::viewFinderFrame, this, &PlasmaCameraManager::processViewfinderFrame);
-            disconnect(plasmaCamera, &PlasmaCamera::stillCaptureFrames, this, &PlasmaCameraManager::processCaptureImage);
+            disconnect(m_plasmaCamera, &PlasmaCamera::photoSaved, this, nullptr);
+            disconnect(m_plasmaCamera, &PlasmaCamera::photoFailed, this, nullptr);
+            disconnect(m_plasmaCamera, &PlasmaCamera::busyChanged, this, nullptr);
         }
 
         m_plasmaCamera = plasmaCamera;
@@ -267,7 +278,17 @@ void PlasmaCameraManager::setPlasmaCamera(PlasmaCamera *plasmaCamera)
             connect(plasmaCamera, &PlasmaCamera::availableChanged, this, &PlasmaCameraManager::setReadyForCapture);
             connect(plasmaCamera, &PlasmaCamera::settingsChanged, this, &PlasmaCameraManager::setSettings);
             connect(plasmaCamera, &PlasmaCamera::viewFinderFrame, this, &PlasmaCameraManager::processViewfinderFrame);
-            connect(plasmaCamera, &PlasmaCamera::stillCaptureFrames, this, &PlasmaCameraManager::processCaptureImage);
+            connect(plasmaCamera, &PlasmaCamera::busyChanged, this, [this]() {
+                Q_EMIT readyForCaptureChanged(isReadyForCapture());
+            });
+            connect(plasmaCamera, &PlasmaCamera::photoSaved, this, [this](int id, const QString &path) {
+                m_pendingPhotos.remove(id);
+                Q_EMIT imageSaved(id, path);
+            });
+            connect(plasmaCamera, &PlasmaCamera::photoFailed, this, [this](int id, const QString &error) {
+                m_pendingPhotos.remove(id);
+                setError(id, ResourceError, error);
+            });
         }
 
         Q_EMIT plasmaCameraChanged();
@@ -509,26 +530,16 @@ void PlasmaCameraManager::processViewfinderFrame(const QImage &image)
     m_currentFrame = image;
     QVideoFrame frame = QVideoFrame(image);
 
-    // Do software rotation
-    // From testing, most drivers don't seem to implement hardware orientation correctly (CameraConfiguration::orientation),
-    // it either isn't supported or just crashes. So we will just use software rotation for best hardware compatibility.
-    switch (m_plasmaCamera->softwareRotationDegrees()) {
-    case 0:
-        break;
-    case 90:
-        frame.setRotation(QtVideo::Rotation::Clockwise90);
-        break;
-    case 180:
-        frame.setRotation(QtVideo::Rotation::Clockwise180);
-        break;
-    case 270:
-        frame.setRotation(QtVideo::Rotation::Clockwise270);
-        break;
+    const int rotation = previewOrientationDegrees();
+    const bool mirrored = previewMirrored();
+    if (rotation != m_publishedPreviewRotation || mirrored != m_publishedPreviewMirrored) {
+        m_publishedPreviewRotation = rotation;
+        m_publishedPreviewMirrored = mirrored;
+        qInfo() << "Preview rotation:" << rotation << "device:" << m_orientationSensorDegrees
+                << "mount:" << m_plasmaCamera->softwareRotationDegrees() << "mirrored:" << mirrored;
+        Q_EMIT previewRotationChanged();
     }
-
-    // Mirror output if requested
-    frame.setMirrored(m_plasmaCamera->mirrorOutput());
-
+    // VideoOutput owns the display rotation so its aspect geometry changes too.
     // Add to sink
     m_videoSink->setVideoFrame(frame);
 
@@ -563,7 +574,7 @@ void PlasmaCameraManager::processCaptureImage(const QQueue<QImage> &frames)
 
     // TODO: set format and quality
     qDebug() << "saving image to " << fileName;
-    const bool res = image.save(&file, "JPEG", 50);
+    const bool res = image.save(&file, "JPEG", 100);
     if (!res) {
         setError(
             0,
@@ -652,27 +663,22 @@ void PlasmaCameraManager::updateFromOrientationSensor()
         return;
     }
 
-    qInfo() << "Orientation sensor reported update:" << reading->orientation();
-
+    float degrees;
     switch (reading->orientation()) {
-    case QOrientationReading::Orientation::TopUp:
-        m_orientationSensorDegrees = 0.0f;
-        break;
-    case QOrientationReading::Orientation::TopDown:
-        m_orientationSensorDegrees = 180.0f;
-        break;
-    case QOrientationReading::Orientation::LeftUp:
-        m_orientationSensorDegrees = 90.0f;
-        break;
-    case QOrientationReading::Orientation::RightUp:
-        m_orientationSensorDegrees = 270.0f;
-        break;
-    case QOrientationReading::Orientation::FaceUp:
-    case QOrientationReading::Orientation::FaceDown:
-    case QOrientationReading::Orientation::Undefined:
+    case QOrientationReading::Orientation::TopUp: degrees = 0; break;
+    case QOrientationReading::Orientation::TopDown: degrees = 180; break;
+    case QOrientationReading::Orientation::LeftUp: degrees = 90; break;
+    case QOrientationReading::Orientation::RightUp: degrees = 270; break;
     default:
-        m_orientationSensorDegrees = 0.0f;
-        break;
+        // Keep the last upright direction while flat or between orientations.
+        m_orientationSettleTimer.stop();
+        return;
+    }
+    if (degrees == m_orientationSensorDegrees) {
+        m_orientationSettleTimer.stop();
+    } else if (!m_orientationSettleTimer.isActive() || degrees != m_pendingOrientationDegrees) {
+        m_pendingOrientationDegrees = degrees;
+        m_orientationSettleTimer.start();
     }
 }
 
@@ -688,13 +694,47 @@ int PlasmaCameraManager::captureImageInternal()
         return newImageCaptureId;
     }
 
+    QDateTime now = QDateTime::currentDateTime();
+    QString baseName = m_imageCaptureFileName;
+    if (m_filenamePattern == 1 || m_filenamePattern == 2)
+        baseName = now.toString(QStringLiteral("yyyyMMddHHmmss"));
+    QString fileName = PlasmaLibcameraUtils::generateFileName(baseName, QLatin1String("jpg"), m_filenamePattern, m_outputPath);
+    const QFileInfo initial(fileName);
+    unsigned int suffix = 0;
+    while (QFileInfo::exists(fileName) || m_pendingPhotos.values().contains(fileName))
+        fileName = initial.absolutePath() + QLatin1Char('/') + initial.completeBaseName() + QLatin1Char('_') + QString::number(++suffix) + QStringLiteral(".jpg");
+    PhotoOptions options;
+    options.id = newImageCaptureId; options.path = fileName; options.captured = now;
+    options.rotation = (qRound(outputOrientationDegrees()) % 360 + 360) % 360;
+    options.mirror = m_plasmaCamera->mirrorOutput();
+    m_pendingPhotos.insert(options.id, fileName);
+    if (!m_plasmaCamera->captureImage(options)) {
+        m_pendingPhotos.remove(options.id);
+        setError(options.id, NotReadyError, QStringLiteral("Camera is not ready"));
+        return options.id;
+    }
     m_imageCaptureNum = newImageCaptureId;
-    m_plasmaCamera->captureImage();
 
     return newImageCaptureId;
 }
 
 float PlasmaCameraManager::outputOrientationDegrees() const
 {
-    return m_plasmaCamera->softwareRotationDegrees() + m_orientationSensorDegrees;
+    return m_plasmaCamera ? cameraDisplayRotation(m_plasmaCamera->softwareRotationDegrees(),
+                                                  qRound(m_orientationSensorDegrees),
+                                                  m_plasmaCamera->mirrorOutput()) : 0;
+}
+
+int PlasmaCameraManager::previewOrientationDegrees() const
+{
+    if (!m_plasmaCamera)
+        return 0;
+    const int physical = qRound(isRecordingVideo() ? m_recordingOrientationDegrees : m_orientationSensorDegrees);
+    return cameraDisplayRotation(m_plasmaCamera->softwareRotationDegrees(), physical,
+                                 m_plasmaCamera->mirrorOutput());
+}
+
+bool PlasmaCameraManager::previewMirrored() const
+{
+    return m_plasmaCamera && m_plasmaCamera->mirrorOutput();
 }

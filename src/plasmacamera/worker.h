@@ -4,6 +4,9 @@
 #pragma once
 
 #include <QTimer>
+#include <QThreadPool>
+#include <optional>
+#include "photojob.h"
 #include <QDebug>
 #include <QImage>
 #include <QQueue>
@@ -50,7 +53,9 @@ Q_SIGNALS:
     //		- might not work properly for QQueue unless copy constructor is done recursively
     //		- it looks like slots with queued connection might work really nicely?
     void viewFinderFrame(const QImage &frame); // connect to this to get new frames
-    void stillCaptureFrames(const QQueue<QImage> &frames); // connect to this to get captures
+    void photoSaved(int id, const QString &path);
+    void photoFailed(int id, const QString &error);
+    void photoCapacity(bool available);
 
 public Q_SLOTS:
     // Camera
@@ -67,7 +72,7 @@ public Q_SLOTS:
     void unsetCamera();
 
     // Photo capture
-    void capture();
+    void capture(const PhotoOptions &options);
 
     void setSettings(const Settings &settings);
 
@@ -98,6 +103,8 @@ private:
         Video,
     };
 
+    void submitPhoto(QImage fallback = {});
+    void collectPhoto(libcamera::Request *request, const QImage &fullFrame);
     void startViewFinder();
     void stopViewFinder();
 
@@ -120,7 +127,7 @@ private:
     int createRequests();
 
     void requestComplete(libcamera::Request *request);
-    void processRequestData(); // convert buffers to QImage stored at m_image
+    bool processRequestData(); // convert buffers to QImage stored at m_image
 
     bool m_error = false;
     QString m_errorString;
@@ -137,14 +144,20 @@ private:
 
     QSize m_size;
     QImage m_image;
+    QImage m_conversionImage;
     Converter m_converter;
     libcamera::PixelFormat m_format;
 
-    // Queue of images for capturing a photo
-    QMutex m_stillCaptureFramesMutex;
-    QQueue<QImage> m_stillCaptureFrames;
 
     libcamera::Stream *m_stream{};
+    libcamera::Stream *m_rawStream{};
+    std::optional<PhotoOptions> m_photoOptions;
+    QQueue<PhotoOptions> m_waitingPhotos;
+    std::vector<PhotoRawFrame> m_photoFrames;
+    QThreadPool m_photoPool;
+    unsigned int m_photoJobs = 0;
+    int m_lastAfState = libcamera::controls::AfStateIdle;
+    bool m_pauseFocus = false, m_resumeFocus = false;
     libcamera::FrameBufferAllocator *m_allocator{};
     std::map<libcamera::FrameBuffer *, std::unique_ptr<Image>> m_mappedBuffers;
     std::vector<std::unique_ptr<libcamera::Request>> m_requests;

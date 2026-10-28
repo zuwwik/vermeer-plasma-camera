@@ -16,6 +16,8 @@ Rectangle {
     id: root
 
     required property PlasmaCamera camera
+    required property int orientation
+    required property bool mirrored
     property real bottomMargin: 0
 
     property alias videoSink: viewfinder.videoSink
@@ -32,6 +34,9 @@ Rectangle {
         id: viewfinder
 
         visible: root.camera.available
+        orientation: root.orientation
+        mirrored: root.mirrored
+        fillMode: VideoOutput.PreserveAspectFit
         width: parent.width
         height: parent.height
     }
